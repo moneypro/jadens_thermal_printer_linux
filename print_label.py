@@ -92,18 +92,62 @@ class LabelPDF:
         return float(left), float(page_h - bottom), float(right), float(page_h - top)
 
     def _crop_to_bbox(self, l: float, b: float, r: float, t: float) -> str:
-        """Use ghostscript to produce a cropped vector PDF."""
-        w = r - l
-        h = t - b
+        """
+        Produce a portrait 4x6 vector PDF from the detected content bbox.
+
+        If the content is landscape (wider than tall), it is rotated 90° CCW
+        so that it fills a portrait 4x6 page. A uniform scale is applied to
+        fit the content exactly within LABEL_W_PTS x LABEL_H_PTS, centred.
+        """
+        cw = r - l   # content width in pts
+        ch = t - b   # content height in pts
+
+        out_w = LABEL_W_PTS
+        out_h = LABEL_H_PTS
+
+        if cw > ch:
+            # Landscape content → rotate 90° CCW then scale to portrait target
+            # After 90° CCW: effective dims are ch (x) × cw (y)
+            scale = min(out_w / ch, out_h / cw)
+            scaled_w = ch * scale
+            scaled_h = cw * scale
+            cx_off = (out_w - scaled_w) / 2
+            cy_off = (out_h - scaled_h) / 2
+            # PostScript ops (applied in order to source points):
+            #  1. translate to origin
+            #  2. rotate 90° CCW  → content is in (-ch,0)-(0,cw)
+            #  3. translate to positive quadrant
+            #  4. scale
+            #  5. translate to centre on page
+            ps = (
+                f"{l:.2f} neg {b:.2f} neg translate "
+                f"90 rotate "
+                f"{ch:.2f} 0 translate "
+                f"{scale:.6f} {scale:.6f} scale "
+                f"{cx_off:.2f} {cy_off:.2f} translate"
+            )
+        else:
+            # Already portrait — just translate + uniform scale
+            scale = min(out_w / cw, out_h / ch)
+            scaled_w = cw * scale
+            scaled_h = ch * scale
+            cx_off = (out_w - scaled_w) / 2
+            cy_off = (out_h - scaled_h) / 2
+            ps = (
+                f"{l:.2f} neg {b:.2f} neg translate "
+                f"{scale:.6f} {scale:.6f} scale "
+                f"{cx_off:.2f} {cy_off:.2f} translate"
+            )
+
         out = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
         subprocess.run([
             "gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
-            f"-dDEVICEWIDTHPOINTS={w:.1f}",
-            f"-dDEVICEHEIGHTPOINTS={h:.1f}",
+            f"-dDEVICEWIDTHPOINTS={out_w:.1f}",
+            f"-dDEVICEHEIGHTPOINTS={out_h:.1f}",
             "-dFIXEDMEDIA",
             "-dCompatibilityLevel=1.4",
             f"-sOutputFile={out}",
-            "-c", f"<</BeginPage {{ {l:.1f} neg {b:.1f} neg translate }}>> setpagedevice",
+            "-c", f"<</BeginPage {{ {ps} }}>> setpagedevice",
             "-f", str(self.source),
         ], check=True, capture_output=True)
         return out

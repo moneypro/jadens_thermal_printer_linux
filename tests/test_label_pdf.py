@@ -1,0 +1,105 @@
+"""
+Tests for LabelPDF — the PDF preparation / cropping module.
+Goal: any input PDF produces a valid, portrait 4x6 vector PDF.
+"""
+
+import subprocess
+from pathlib import Path
+import pytest
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from print_label import LabelPDF, LABEL_W_PTS, LABEL_H_PTS
+
+FIXTURES = Path(__file__).parent / "fixtures"
+LETTER_LABEL = FIXTURES / "shipping_label_letter.pdf"   # 8.5x11 with label in top half
+SIZED_LABEL  = FIXTURES / "Labels-Sample.pdf"           # already ~4x6
+
+TOLERANCE_PTS = 36  # ±0.5 inch — "satisfied the minimum"
+
+
+def pdf_size_pts(path: str) -> tuple[float, float]:
+    """Return (width, height) of first page in points via pdfinfo."""
+    out = subprocess.run(["pdfinfo", path], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if line.startswith("Page size:"):
+            parts = line.split()
+            return float(parts[2]), float(parts[4])
+    raise ValueError(f"Could not read size from {path}")
+
+
+def is_portrait_4x6(w: float, h: float) -> bool:
+    return (
+        abs(w - LABEL_W_PTS) <= TOLERANCE_PTS and
+        abs(h - LABEL_H_PTS) <= TOLERANCE_PTS
+    )
+
+
+# ── Already-sized PDF (Labels-Sample.pdf ~3.81" x 6") ────────────────────────
+
+class TestAlreadySized:
+    def test_returns_original_path(self):
+        """No crop needed → original path is returned, no temp file created."""
+        with LabelPDF(str(SIZED_LABEL)) as label:
+            result = label.prepare()
+        assert result == str(SIZED_LABEL)
+
+    def test_no_temp_file_created(self):
+        """Context exit should leave no temp files."""
+        with LabelPDF(str(SIZED_LABEL)) as label:
+            result = label.prepare()
+            tmp = label._cropped_tmp
+        assert tmp is None
+
+    def test_output_dimensions_within_tolerance(self):
+        """Output dimensions should be within ±0.5 inch of 4x6."""
+        with LabelPDF(str(SIZED_LABEL)) as label:
+            result = label.prepare()
+        w, h = pdf_size_pts(result)
+        assert is_portrait_4x6(w, h), f"Expected ~{LABEL_W_PTS}x{LABEL_H_PTS} pts, got {w:.1f}x{h:.1f}"
+
+
+# ── Letter-size PDF (shipping_label_letter.pdf 8.5x11) ───────────────────────
+
+class TestLetterSizeCrop:
+    def test_returns_different_path(self):
+        """Crop needed → a new temp file is returned."""
+        with LabelPDF(str(LETTER_LABEL)) as label:
+            result = label.prepare()
+        assert result != str(LETTER_LABEL)
+
+    def test_output_is_valid_pdf(self):
+        """Cropped output must be a valid PDF file."""
+        with LabelPDF(str(LETTER_LABEL)) as label:
+            result = label.prepare()
+            with open(result, "rb") as f:
+                header = f.read(4)
+        assert header == b"%PDF", f"Output does not start with %PDF"
+
+    def test_output_dimensions_portrait_4x6(self):
+        """Cropped output must be portrait 4x6 within ±0.5 inch."""
+        with LabelPDF(str(LETTER_LABEL)) as label:
+            result = label.prepare()
+            w, h = pdf_size_pts(result)
+        assert is_portrait_4x6(w, h), f"Expected ~{LABEL_W_PTS}x{LABEL_H_PTS} pts, got {w:.1f}x{h:.1f}"
+
+    def test_temp_file_cleaned_up_after_close(self):
+        """Temp file must be deleted after close()."""
+        label = LabelPDF(str(LETTER_LABEL))
+        result = label.prepare()
+        assert Path(result).exists()
+        label.close()
+        assert not Path(result).exists()
+
+    def test_temp_file_cleaned_up_after_context_exit(self):
+        """Temp file must be deleted after __exit__."""
+        with LabelPDF(str(LETTER_LABEL)) as label:
+            result = label.prepare()
+        assert not Path(result).exists()
+
+    def test_double_close_is_safe(self):
+        """Calling close() twice should not raise."""
+        label = LabelPDF(str(LETTER_LABEL))
+        label.prepare()
+        label.close()
+        label.close()  # should not raise
