@@ -27,6 +27,12 @@ LABEL_W_PTS     = LABEL_W_IN * 72   # 288 pts
 LABEL_H_PTS     = LABEL_H_IN * 72   # 432 pts
 DETECT_DPI      = 72    # low-res render just for content detection
 PADDING_PTS     = 6     # whitespace to keep around detected content
+MAX_MARGIN_PTS  = 36    # 0.5 inch — max allowed margin on any single side
+
+
+class ExcessiveMarginError(ValueError):
+    """Raised when the generated PDF has too much whitespace on any side."""
+    pass
 
 
 class LabelPDF:
@@ -95,81 +101,121 @@ class LabelPDF:
         """
         Produce a portrait 4x6 vector PDF from the detected content bbox.
 
-        If the content is landscape (wider than tall), it is rotated 90° CCW
-        so that it fills a portrait 4x6 page. A uniform scale is applied to
-        fit the content exactly within LABEL_W_PTS x LABEL_H_PTS, centred.
+        Uses pypdf to set the page MediaBox/CropBox to the content area, then
+        gs -dPDFFitPage to scale to fit.  Landscape content gets /Rotate 90 so
+        it displays and prints as portrait.
         """
-        cw = r - l   # content width in pts
-        ch = t - b   # content height in pts
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import RectangleObject
 
-        out_w = LABEL_W_PTS
-        out_h = LABEL_H_PTS
+        # Step 1 — crop page to content area via pypdf MediaBox/CropBox
+        reader = PdfReader(str(self.source))
+        writer = PdfWriter()
+        page = reader.pages[0]
+        page.mediabox = RectangleObject((l, b, r, t))
+        page.cropbox  = RectangleObject((l, b, r, t))
+        writer.add_page(page)
+        tmp_cropped = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+        with open(tmp_cropped, "wb") as f:
+            writer.write(f)
 
-        if cw > ch:
-            # Landscape content → rotate 90° CCW then scale to portrait target
-            # After 90° CCW: effective dims are ch (x) × cw (y)
-            scale = min(out_w / ch, out_h / cw)
-            scaled_w = ch * scale
-            scaled_h = cw * scale
-            cx_off = (out_w - scaled_w) / 2
-            cy_off = (out_h - scaled_h) / 2
-            # PostScript ops (applied in order to source points):
-            #  1. translate to origin
-            #  2. rotate 90° CCW  → content is in (-ch,0)-(0,cw)
-            #  3. translate to positive quadrant
-            #  4. scale
-            #  5. translate to centre on page
-            ps = (
-                f"{l:.2f} neg {b:.2f} neg translate "
-                f"90 rotate "
-                f"{ch:.2f} 0 translate "
-                f"{scale:.6f} {scale:.6f} scale "
-                f"{cx_off:.2f} {cy_off:.2f} translate"
-            )
-        else:
-            # Already portrait — just translate + uniform scale
-            scale = min(out_w / cw, out_h / ch)
-            scaled_w = cw * scale
-            scaled_h = ch * scale
-            cx_off = (out_w - scaled_w) / 2
-            cy_off = (out_h - scaled_h) / 2
-            ps = (
-                f"{l:.2f} neg {b:.2f} neg translate "
-                f"{scale:.6f} {scale:.6f} scale "
-                f"{cx_off:.2f} {cy_off:.2f} translate"
-            )
+        # Step 2 — scale to fit landscape 4x6 device; rotate 90° for portrait display
+        cw, ch = r - l, t - b
+        landscape = cw > ch
+        dev_w = LABEL_H_PTS if landscape else LABEL_W_PTS  # 432 or 288
+        dev_h = LABEL_W_PTS if landscape else LABEL_H_PTS  # 288 or 432
+        rotate_cmd = "[{ThisPage} << /Rotate 90 >> /PUT pdfmark" if landscape else ""
 
         out = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
-        subprocess.run([
+        cmd = [
             "gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
-            f"-dDEVICEWIDTHPOINTS={out_w:.1f}",
-            f"-dDEVICEHEIGHTPOINTS={out_h:.1f}",
-            "-dFIXEDMEDIA",
+            f"-dDEVICEWIDTHPOINTS={dev_w:.1f}",
+            f"-dDEVICEHEIGHTPOINTS={dev_h:.1f}",
+            "-dFIXEDMEDIA", "-dPDFFitPage",
             "-dCompatibilityLevel=1.4",
             f"-sOutputFile={out}",
-            "-c", f"<</BeginPage {{ {ps} }}>> setpagedevice",
-            "-f", str(self.source),
-        ], check=True, capture_output=True)
+        ]
+        if rotate_cmd:
+            cmd += ["-c", rotate_cmd, "-f", tmp_cropped]
+        else:
+            cmd += [tmp_cropped]
+
+        subprocess.run(cmd, check=True, capture_output=True)
+        os.unlink(tmp_cropped)
         return out
+
+    def _render_to_image(self, pdf_path: str) -> Image.Image:
+        """Render first page of a PDF at DETECT_DPI and return as RGB image."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+        subprocess.run([
+            "gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=png16m",
+            f"-r{DETECT_DPI}", f"-sOutputFile={tmp}", pdf_path,
+        ], check=True, capture_output=True)
+        img = Image.open(tmp).convert("RGB")
+        os.unlink(tmp)
+        return img
+
+    def validate(self, pdf_path: str) -> dict:
+        """
+        Render the PDF and verify no side has excessive whitespace.
+
+        Returns a dict with margin measurements (in pts) for all four sides.
+        Raises ExcessiveMarginError if any margin exceeds MAX_MARGIN_PTS.
+        """
+        img = self._render_to_image(pdf_path)
+        arr = np.array(img)
+        mask = (arr < 245).any(axis=2)
+        rows = np.where(mask.any(axis=1))[0]
+        cols = np.where(mask.any(axis=0))[0]
+
+        if rows.size == 0 or cols.size == 0:
+            raise ExcessiveMarginError("Output PDF appears to be blank")
+
+        # At DETECT_DPI=72, 1 pixel ≈ 1 pt
+        margins = {
+            "left":   float(cols[0]),
+            "right":  float(img.width  - 1 - cols[-1]),
+            "top":    float(rows[0]),
+            "bottom": float(img.height - 1 - rows[-1]),
+        }
+
+        excessive = {side: pts for side, pts in margins.items()
+                     if pts > MAX_MARGIN_PTS}
+        if excessive:
+            details = ", ".join(f"{s}={v:.1f}pts ({v/72:.2f}\")"
+                                for s, v in excessive.items())
+            raise ExcessiveMarginError(
+                f"Output PDF has excessive margin — {details} "
+                f"(max allowed: {MAX_MARGIN_PTS}pts / {MAX_MARGIN_PTS/72:.2f}\")"
+            )
+
+        return margins
 
     def prepare(self) -> str:
         """
-        Return path to a print-ready PDF.
+        Return path to a validated, print-ready PDF.
         If cropping was needed, returns a temp file (cleaned up on close()).
         Otherwise returns the original path.
+        Raises ExcessiveMarginError if the output has too much whitespace.
         """
         w, h = self._page_size_pts()
         print(f"  Source page: {w/72:.2f}\" x {h/72:.2f}\"")
 
         if not self._needs_crop(w, h):
             print("  Already label-sized, no crop needed.")
-            return str(self.source)
+            result = str(self.source)
+        else:
+            print("  Letter-size detected — auto-cropping to label content ...")
+            l, b, r, t = self._detect_bbox_pts()
+            print(f"  Content bbox: {(r-l)/72:.2f}\" x {(t-b)/72:.2f}\"")
+            self._cropped_tmp = self._crop_to_bbox(l, b, r, t)
+            result = self._cropped_tmp
 
-        print("  Letter-size detected — auto-cropping to label content ...")
-        l, b, r, t = self._detect_bbox_pts()
-        print(f"  Content bbox: {(r-l)/72:.2f}\" x {(t-b)/72:.2f}\"")
-        self._cropped_tmp = self._crop_to_bbox(l, b, r, t)
-        return self._cropped_tmp
+        margins = self.validate(result)
+        print(f"  Margins (pts) — "
+              f"L:{margins['left']:.0f} R:{margins['right']:.0f} "
+              f"T:{margins['top']:.0f} B:{margins['bottom']:.0f}")
+        return result
 
     def close(self):
         if self._cropped_tmp and os.path.exists(self._cropped_tmp):
